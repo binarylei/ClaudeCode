@@ -1,0 +1,15 @@
+{
+  "name": "claude-code-mydocs",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ClaudeCode 源码分析文档",
+  "type": "module",
+  "scripts": {
+    "dev": "vitepress dev",
+    "build": "vitepress build",
+    "preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "vitepress": "^1.6.3"
+  }
+}
