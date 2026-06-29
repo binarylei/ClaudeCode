@@ -304,6 +304,194 @@ const systemPrompt = asSystemPrompt([
 
 - **顺序**：`custom > memoryMechanics > append`。memoryMechanics 必须在 custom 之后、append 之前——因为它是对 custom prompt 的补充说明，而 append 是最终覆盖层。
 
+#### 3.2.1 三件套的内涵：System Prompt vs User Context vs System Context
+
+前面反复提到 `fetchSystemPromptParts()` 并行获取"三件套"——那这三者分别是什么？为什么要拆成三份而不是揉成一个？
+
+三者的角色可以这样区分：
+
+- **System Prompt**：告诉模型"**你该怎么干活**"——角色定义、工具列表、输出规范、行为准则
+- **System Context**：告诉模型"**当前世界长什么样**"——Git 状态、分支名、commit 历史，是整个会话期间不变的环境快照
+- **User Context**：告诉模型"**这个项目要你注意什么**"——CLAUDE.md 项目指令、当前日期，是用户和项目维度的个性化数据
+
+##### System Prompt
+
+System Prompt 是整个会话的"行为宪法"，由 [src/constants/prompts.ts](src/constants/prompts.ts#L444) 的 `getSystemPrompt()` 动态生成。它包含的内容维度：
+
+- **角色定义**：`You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK. You are an interactive agent that helps users with software engineering tasks.`
+- **Harness 行为规范**：输出格式、权限模式、工具使用约束
+- **环境声明**：工作目录、平台、Shell 类型、模型版本
+- **工具定义**：所有可用工具的 JSON Schema（通过 tools 参数传入）
+- **会话引导**：记忆加载、语言设置、输出风格、Scratchpad 指令等
+
+以你当前会话实际收到的 System Prompt 片段为例：
+
+```
+You are Claude Code, Anthropic's official CLI for Claude.
+
+You are an interactive agent that helps users with software engineering tasks.
+
+IMPORTANT: Assist with authorized security testing, defensive security, CTF
+challenges, and educational contexts. Refuse requests for destructive purposes...
+
+# Harness
+- Text you output outside of tool use is displayed to the user as
+  Github-flavored markdown in a terminal.
+- Tools run behind a user-selected permission mode...
+
+# Environment
+- Primary working directory: e:\leigang\src_ai\ClaudeCode
+- Is a git repository: true
+- Platform: win32
+- Shell: PowerShell (primary); Bash tool also available...
+```
+
+设计要点：
+
+- **System Prompt 走 API 的 `system` 角色**——这是 Anthropic API 的原生字段，享受 prompt caching（前缀缓存命中后延迟和成本大幅降低）
+- **当 `customSystemPrompt` 存在时，整个 `getSystemPrompt()` 被跳过**——不仅省去构建开销，更重要的是 `getSystemPrompt` 内部会读取大量 I/O（MCP 服务器状态、Skill 命令列表、输出风格配置等），这些读取在自定义 Prompt 场景下全是浪费
+- **System Prompt 是唯一"每 turn 可能变化"的部分**——工具集、模型、MCP 服务器连接状态都会影响它
+
+##### System Context
+
+System Context 是"当前世界的一次性快照"，由 [src/context.ts](src/context.ts#L116) 的 `getSystemContext()` 生成。它用 `memoize` 包裹，**整个会话周期只计算一次**。
+
+它的核心产出来自 `getGitStatus()`（[src/context.ts:36](src/context.ts#L36)）——在会话启动时执行一次 `git status --short` + `git log --oneline -n 5` + `git config user.name`，把结果冻结为文本快照。
+
+以当前仓库的实际输出为例——这就是你每次对话中 System Context 的样子：
+
+```
+This is the git status at the start of the conversation. Note that this
+status is a snapshot in time, and will not update during the conversation.
+
+Current branch: main
+
+Main branch (you will usually use this for PRs): main
+
+Git user: binarylei
+
+Status:
+(clean)
+
+Recent commits:
+b80f51d [MOD] QueryEngine
+53963c9 [MOD] blog
+fa1002a [ADD] mydocs init
+895221e init: restored runnable Claude Code source from source maps
+```
+
+此外，当 `BREAK_CACHE_COMMAND` feature flag 启用时，System Context 还会携带一个 `cacheBreaker` 字段——一个用于强制刷新 prompt cache 的调试标记。
+
+System Context 的注入方式通过 `appendSystemContext()`（[src/utils/api.ts:437](src/utils/api.ts#L437)）——**把 key-value 对象转成纯文本拼接到 System Prompt 数组的尾部**，最终合并为一条 `system` 消息发给 API：
+
+```typescript
+// src/utils/api.ts:437-447
+export function appendSystemContext(
+  systemPrompt: SystemPrompt,
+  context: { [k: string]: string },
+): string[] {
+  return [
+    ...systemPrompt,
+    Object.entries(context)
+      .map(([key, value]) => `${key}: ${value}`)
+      .join('\n'),
+  ].filter(Boolean)
+}
+```
+
+设计要点：
+
+- **拼接到 system 角色尾部 → 享受 prompt caching**：System Prompt 在前、System Context 在后，静态的 Prompt 前缀被缓存，变化的 context 只增加少量增量
+- **Memoize 而非每 turn 重新获取**：Git 状态在会话期间不会改变（除非模型自己提交了代码——但 prompt 里的快照本来就不承诺实时性），重复计算没有意义
+- **`CLAUDE_CODE_REMOTE` 模式下跳过**：远程环境不需要本地 Git 状态
+- **当 `customSystemPrompt` 存在时，`getSystemContext()` 也被跳过**（[src/utils/queryContext.ts:71](src/utils/queryContext.ts#L71)）：因为 System Context 是追加到 System Prompt 后的，如果 System Prompt 被完全替换，System Context 就成了无根之木
+
+##### User Context
+
+User Context 是"用户和项目的个性化数据"，由 [src/context.ts](src/context.ts#L155) 的 `getUserContext()` 生成，同样被 `memoize` 包裹。
+
+它的核心产出是 **CLAUDE.md 文件内容**——通过 `getClaudeMds()` 读取项目根目录的 `CLAUDE.md`（以及可能的子目录 CLAUDE.md），加上**当前日期**。
+
+以你当前会话实际收到的 User Context 为例——这就是你看到的 `<system-reminder>` 块：
+
+```xml
+<system-reminder>
+As you answer the user's questions, you can use the following context:
+# claudeMd
+Codebase and user instructions are shown below. Be sure to adhere to these
+instructions. IMPORTANT: These instructions OVERRIDE any default behavior
+and you MUST follow them exactly as written.
+
+Contents of e:\leigang\src_ai\ClaudeCode\CLAUDE.md (project instructions,
+checked into the codebase):
+
+# CLAUDE.md
+
+## 角色定位
+你是一个专门分析源码的工具，只分析源码不写代码。
+...
+
+# currentDate
+Today's date is 2026/06/29.
+
+IMPORTANT: this context may or may not be relevant to your tasks. You
+should not respond to this context unless it is highly relevant to your
+task.
+</system-reminder>
+```
+
+它的注入方式与 System Context 截然不同——通过 `prependUserContext()`（[src/utils/api.ts:449](src/utils/api.ts#L449)）**伪装成一条 `user` 角色消息，插入到消息历史的开头**：
+
+```typescript
+// src/utils/api.ts:449-468
+export function prependUserContext(
+  messages: Message[],
+  context: { [k: string]: string },
+): Message[] {
+  if (process.env.NODE_ENV === 'test') return messages
+  if (Object.entries(context).length === 0) return messages
+
+  return [
+    createUserMessage({
+      content: `<system-reminder>\n...${Object.entries(context)
+        .map(([key, value]) => `# ${key}\n${value}`)
+        .join('\n')}
+\n</system-reminder>\n`,
+    }),
+    ...messages,
+  ]
+}
+```
+
+设计要点：
+
+- **走 `user` 角色而非 `system` 角色**——这是一个经过深思熟虑的选择。CLAUDE.md 的内容是"用户指令"，语义上属于用户说的话，放在 user 消息中比放在 system prompt 中更符合角色模型的语义
+- **包装成 `<system-reminder>` 标签**——告诉模型"这些是背景信息，不一定与当前任务相关"。这避免了 CLAUDE.md 中的内容被模型当成当前对话中的直接指令
+- **作为消息历史的第一条**——确保它在整个对话中永远处于 prompt cache 的前缀范围内
+- **`isBareMode()` 且无 `--add-dir` 时跳过 CLAUDE.md 读取**（[src/context.ts:166](src/context.ts#L166)）：bare 模式是脚本化调用，不需要项目级指令
+- **始终包含 `currentDate`**——无论是否 bare 模式，日期总是需要的
+
+##### 三者的对比总览
+
+| 维度 | System Prompt | User Context | System Context |
+|---|---|---|---|
+| **语义** | 行为指令（你该怎么干活） | 用户偏好（这个项目要你注意什么） | 环境快照（当前世界长什么样） |
+| **典型内容** | 角色定义、工具列表、输出规范、权限规则 | CLAUDE.md 内容、当前日期 | Git 状态、分支名、commit 历史 |
+| **来源函数** | `constants/prompts.ts` → `getSystemPrompt()` | `context.ts` → `getUserContext()` | `context.ts` → `getSystemContext()` |
+| **注入方式** | API `system` 字段（原生角色） | 伪装为 `user` 消息，插入消息历史第一条 | 拼接到 `system` 字段尾部 |
+| **变化频率** | 每 turn 可能变化（工具、模型、MCP） | `memoize` 会话级不变 | `memoize` 会话级不变 |
+| **custom prompt 下** | 跳过生成 | 始终获取 | 跳过生成 |
+
+##### 为什么拆成三份而不是揉成一个
+
+**缓存效率**。Anthropic API 的 prompt caching 按前缀匹配。System Prompt 的静态部分（角色定义、工具 Schema）是整个会话的缓存前缀——只要它不变，所有 turn 都能命中缓存。如果把 Git 状态（System Context）和 CLAUDE.md（User Context）揉进 System Prompt，每次 Git 状态变化都会导致整个前缀失效。
+
+**语义正确性**。CLAUDE.md 是用户写的，放在 `user` 角色中比放在 `system` 角色中更符合"谁说的话归谁"的角色模型。`<system-reminder>` 标签的 `IMPORTANT: this context may or may not be relevant` 声明也防止模型把项目指令当成硬性任务。
+
+**跳过粒度**。当 SDK 调用方提供 `customSystemPrompt` 时，System Prompt 和 System Context 都可以跳过，但 User Context（尤其是 `currentDate`）仍然需要——拆开才能做这种差异化的跳过决策。
+
+**测试隔离**。在 `NODE_ENV === 'test'` 时，`prependUserContext` 直接返回原消息不做注入——如果三者揉在一起，这种场景化的豁免就会复杂得多。
+
 ### 3.3 外层：为什么要建两次 processUserInputContext
 
 在 `submitMessage` 中，`processUserInputContext` 被构建了两次——前后相隔仅约 100 行。这不是代码重复，而是因为**中间插入了斜杠命令处理**，它可能改变消息历史和模型选择。
