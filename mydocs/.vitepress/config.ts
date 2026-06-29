@@ -20,7 +20,7 @@ export default defineConfig({
         ],
       },
       {
-        text: 'Part 1：Harness 总览 — 架构全景与设计哲学',
+        text: 'Part 1：Harness 总览',
         collapsed: false,
         items: [
           { text: '01. 什么是 Agent Harness', link: '/part1/01-什么是Agent-Harness' },
@@ -30,7 +30,7 @@ export default defineConfig({
         ],
       },
       {
-        text: 'Part 2：核心循环 — Agent 的大脑中枢',
+        text: 'Part 2：核心循环',
         collapsed: true,
         items: [
           { text: '05. QueryEngine 全景解析', link: '/part2/05-QueryEngine全景解析' },
@@ -40,7 +40,7 @@ export default defineConfig({
         ],
       },
       {
-        text: 'Part 3：工具系统 — Agent 的双手',
+        text: 'Part 3：工具系统',
         collapsed: true,
         items: [
           { text: '09. 工具基类设计', link: '/part3/09-工具基类设计' },
@@ -52,7 +52,7 @@ export default defineConfig({
         ],
       },
       {
-        text: 'Part 4：命令系统 — 用户驱动的操作入口',
+        text: 'Part 4：命令系统',
         collapsed: true,
         items: [
           { text: '15. 命令注册与路由', link: '/part4/15-命令注册与路由' },
@@ -61,7 +61,7 @@ export default defineConfig({
         ],
       },
       {
-        text: 'Part 5：知识系统 — 按需学习与渐进式披露',
+        text: 'Part 5：知识系统',
         collapsed: true,
         items: [
           { text: '18. 技能系统设计', link: '/part5/18-技能系统设计' },
@@ -70,7 +70,7 @@ export default defineConfig({
         ],
       },
       {
-        text: 'Part 6：上下文管理 — Agent 的记忆工程',
+        text: 'Part 6：上下文管理',
         collapsed: true,
         items: [
           { text: '21. 上下文收集机制', link: '/part6/21-上下文收集机制' },
@@ -80,7 +80,7 @@ export default defineConfig({
         ],
       },
       {
-        text: 'Part 7：多智能体协调 — Team Harness',
+        text: 'Part 7：多智能体协调',
         collapsed: true,
         items: [
           { text: '25. 子智能体生成', link: '/part7/25-子智能体生成' },
@@ -90,7 +90,7 @@ export default defineConfig({
         ],
       },
       {
-        text: 'Part 8：权限系统 — Agent 的安全边界',
+        text: 'Part 8：权限系统',
         collapsed: true,
         items: [
           { text: '29. 多级权限模式', link: '/part8/29-多级权限模式' },
@@ -99,7 +99,7 @@ export default defineConfig({
         ],
       },
       {
-        text: 'Part 9：Bridge 与终端交互 — 跨越 CLI 的 Harness 延伸',
+        text: 'Part 9：Bridge 与终端交互',
         collapsed: true,
         items: [
           { text: '32. Bridge 架构全景', link: '/part9/32-Bridge架构全景' },
@@ -109,7 +109,7 @@ export default defineConfig({
         ],
       },
       {
-        text: 'Part 10：基础设施 — Harness 的运行底座',
+        text: 'Part 10：基础设施',
         collapsed: true,
         items: [
           { text: '36. 启动链路', link: '/part10/36-启动链路' },
@@ -120,7 +120,7 @@ export default defineConfig({
         ],
       },
       {
-        text: 'Part 11：总结 — Harness 工程的启示',
+        text: 'Part 11：总结',
         collapsed: true,
         items: [
           { text: '41. Harness 工程师的五大职责', link: '/part11/41-Harness工程师的五大职责' },
