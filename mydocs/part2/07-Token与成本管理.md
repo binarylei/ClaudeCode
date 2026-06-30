@@ -10,13 +10,11 @@ outline: [2, 3]
 
 ## 1. 背景介绍
 
-### 1.1 什么是 Token 与成本管理
-
-在 Agent 系统中，Token 是双重身份的载体：它既是**上下文容量的度量单位**（上下文窗口能装多少 token），也是 **API 调用的计费依据**（按 input / output token 计费）。Token 与成本管理系统要回答的核心问题是：
+Token 是双重身份的载体：它既是**上下文容量的度量单位**（上下文窗口能装多少 token），也是 **API 调用的计费依据**（按 input / output token 计费）。Token 与成本管理系统要回答的核心问题是：
 
 > **每个字都有成本，如何让用户在"够用"和"不超支"之间找到平衡？**
 
-### 1.2 认知锚点：一次性计费 vs 累积计费
+### 1.1 一次性计费 vs 累积计费
 
 理解 Agent 系统的成本挑战，最直观的方式是将它与传统 API 调用做对比：
 
@@ -33,7 +31,7 @@ Agent 系统（累积计费）：
 
 关键差异一句话说清：**传统 API 的计费单元是"一次调用"，Agent 的计费单元是"一次任务"——而任务长度不可预知。** 一次复杂的重构可能跑 20 轮 loop，每轮都把上一轮的工具结果（可能包含数万行代码）重新塞回 input。成本不是线性增长，而是**叠加式膨胀**。
 
-### 1.3 极端假设法框定问题空间
+### 1.2 极端假设法框定问题空间
 
 | 极端 | 方案 | 问题 |
 |------|------|------|
@@ -42,7 +40,7 @@ Agent 系统（累积计费）：
 
 两种极端的折衷方案是 **分级预警 + 收益递减检测 + 可配置硬上限**：让模型在预算内"尽力跑"，但在接近限制时给出提示，在明显空转时果断刹车。这就是本章要讲的完整闭环。
 
-### 1.4 正交分解：四个子问题
+### 1.3 正交分解：四个子问题
 
 将"Token 与成本管理"正交分解为四个独立维度:
 
@@ -66,13 +64,44 @@ Agent 系统（累积计费）：
  └──────────────────────┘      └──────────────────────────┘
 ```
 
-这四个模块互相独立又环环相扣：度量提供数据基础，预测填补 API 调用前的时间窗口，控制基于度量结果做决策，通知把控制决策翻译成用户可理解的语言。
+这四个模块互相独立又环环相扣：度量提供数据基础，预测填补 API 调用前的时间窗口，控制基于度量结果做决策，通知把控制决策翻译成用户可理解的语言。具体每个模块如何嵌入 Agent Loop 的迭代体、各自面临什么设计约束，是第 2 节要回答的问题。
 
 ---
 
 ## 2. 核心逻辑
 
-### 2.1 度量层：为什么需要"精确计数 + 粗略估算"双轨制？
+### 2.1 总览：四维在 queryLoop 中的挂载点
+
+在深入各维度的设计之前，先将四个子系统标注到[第 6 章](../part2/06-Agent-Loop机制)建立的 `queryLoop` 迭代体上。🔵 表示 06 已建立的循环结构，🔴 表示本章子系统的触发位置：
+
+```mermaid
+flowchart LR
+    PRE["🔵 预处理"] --> CALL["🔵 callModel"]
+    CALL --> STREAM["🔵 流式消费"]
+    STREAM --> BRANCH{"🔵 分支"}
+    BRANCH -->|"tools"| TOOLS["🔵 工具执行"] --> PRE
+    BRANCH -->|"end"| TERM["🔵 Terminal"]
+    PRE -.- P1["🔴 预测"]
+    CALL -.- P2["🔴 重试控制\n🔴 通知"]
+    STREAM -.- P3["🔴 度量"]
+    BRANCH -.- P4["🔴 预算控制"]
+    TERM -.- P5["🔴 事后度量"]
+```
+
+具体映射关系：
+
+- **预测** 在预处理流水线入口触发（每次调 API 之前），判断是否需要压缩，消费方是 06 §3.4 的 5 步减法流水线。
+- **度量** 在 `callModel` 返回后触发，从 `message.usage` 提取精确数据，合并新消息的粗略估算，供 `tokenCountWithEstimation()` 的所有调用点使用。
+- **重试控制** 在 `withRetry` 内部触发（529/429/网络错误），决定是否重试以及何种策略，消费方是 06 §3.7 的重试层。
+- **预算控制** 在 `!needsFollowUp` 分支触发（模型无工具调用、准备终止时），判定 Continue 还是 Stop，消费方是 06 §3.5 的 Continue/Terminal 状态机。
+- **通知** 在 `callModel` 返回后触发，解析速率限制响应头，更新 `currentLimits` 状态，输出到 UI 渲染和 status line 脚本。
+- **事后度量** 在循环结束后触发，汇总全部 usage 匹配定价计算 USD，展示给具有 billing 权限的用户。
+
+::: tip 关键洞察
+Token 管理的四个子系统不改变 `while(true)` 的结构——它们作为**观察者和守卫**嵌入在循环相位中。预测是"进门守卫"（进去之前看一眼），度量是"账房"（每笔交易后记账），控制是"刹车"（条件满足时终止循环），通知是"仪表盘"（实时显示当前状态）。
+:::
+
+### 2.2 度量层：为什么需要"精确计数 + 粗略估算"双轨制？
 
 先从最朴素的问题开始：**当前上下文用了多少 token？**
 
@@ -81,7 +110,7 @@ Agent 系统（累积计费）：
 1. **事后精确路径**：API 每次调用返回 `usage` 对象（`input_tokens`、`output_tokens`、`cache_*_tokens`），这是标准答案
 2. **事前估算路径**：在 API 调用之前（如压缩决策时），对尚未发送的消息估算 token 数
 
-为什么需要第二条路径？因为最关键的决策——**要不要触发上下文压缩**——必须在调用 API **之前**做出。一旦 API 返回 `model_context_window_exceeded` 错误，上下文已经溢出了，用户等了几秒只等来一个错误。
+为什么需要第二条路径？因为[第 6 章](../part2/06-Agent-Loop机制#_3-4-5-步预处理流水线的顺序设计)的 5 步预处理流水线中，步骤 ②-⑤ 每一步的执行判断都依赖于一个 token 估算值：**当前消息历史有没有超过压缩阈值**。这个判断必须在调用 API **之前**做出——一旦 API 返回 `model_context_window_exceeded` 错误，上下文已经溢出了，用户等了几秒只等来一个错误。
 
 两条路径各自适用不同场景，这就是 Claude Code 度量层的核心设计：
 
@@ -115,7 +144,7 @@ flowchart LR
 在 Token 管理的设计空间中，"一致性"比"精确性"更重要。上下文窗口是否真的 199k token 不重要，重要的是**每次判断用的都是同一把尺子**。否则会出现"压缩判断认为没到阈值，实际 API 调用却报溢出"的不一致。
 :::
 
-### 2.2 预测层：为什么是四层 Fallback？
+### 2.3 预测层：为什么是四层 Fallback？
 
 度量层的"事前估算"路径，本质是一个跨提供商的 token 估算管线：
 
@@ -161,7 +190,7 @@ export function bytesPerTokenForFileType(fileExtension: string): number {
 `bytesPerTokenForFileType` 的设计说明了一个原则：**粗略估算不等于"随便估"。** 在关键决策点（工具结果截断判断），即使 2 行 switch-case，也能把误差从 50% 降到 25%。
 :::
 
-### 2.3 控制层：BudgetTracker 的"收益递减"哲学
+### 2.4 控制层：BudgetTracker 的"收益递减"哲学
 
 如果用户设置了预算（如 `+500k`），Agent Loop 的每一轮都需要回答：**模型还在"有效工作"还是"已经空转"？**
 
@@ -197,7 +226,7 @@ flowchart TD
 
 此外，`continuationCount` 计的不是"总共继续了几轮"，而是"预算预警后继续了几轮"。这个区别很重要：正常消耗和超预算消耗是不同的语义。一个 5 轮完成的任务有 `continuationCount = 0`，而一个触达预算又继续 3 轮的任务有 `continuationCount = 3`。
 
-### 2.4 速率限制：为什么分成 5h / 7d / overage 三层？
+### 2.5 速率限制：为什么分成 5h / 7d / overage 三层？
 
 速率限制（Rate Limiting）和预算控制是两回事：预算是"用户层面的成本控制"，速率限制是"服务端的资源保护"。但两者共享同一个信息通道——API 响应头。
 
@@ -225,37 +254,6 @@ type EarlyWarningThreshold = {
 
 seven_day 的三级预警更细腻——它在 75%、50%、25% 三个水位各设置了一个时间-用量交叉点，形成一条"预警曲线"。用户不会在 74% 时什么都不知道、75% 时突然收到严重警告，而是随着消耗加速逐步收到越来越紧迫的提示。
 
-### 2.5 重试策略的设计分层
-
-速率限制落地到 API 调用层，就是重试策略。Claude Code 的 `withRetry` 约 800 行，核心逻辑可以用一张决策表概括：
-
-| 错误类型 | 重试策略 | 设计意图 |
-|---------|---------|---------|
-| 529 (Overloaded) | 最多 3 次，指数退避 | 529 是服务端过载信号，多次重试 = 雪上加霜（retry storm）；3 次是"给一次机会但别加剧过载"的折衷 |
-| 429 (Rate Limit) | 跟随 `Retry-After` 头 | 确定性信号，等够时间就能过 |
-| ECONNRESET / EPIPE | 退避重试 + 禁用 keep-alive | 网络瞬断，值得重试；但旧的 keep-alive socket 可能已失效 |
-| 非交互场景（summary / title / classifier） | **不重试 529** | 用户不等待这些结果，重试是过载服务的纯额外负担 |
-| Fast mode 429/529 | 短延迟则保 cache 重试；长延迟则切回标准速度 | 权衡 cache 保真（fast mode 用不同 model name，切换会掉 cache）vs 响应时间 |
-
-最具启发性的设计是**非交互场景不重试 529**：
-
-```typescript
-// src/services/api/withRetry.ts:62-63, 88
-const FOREGROUND_529_RETRY_SOURCES = new Set<QuerySource>([
-  'repl_main_thread', 'sdk', 'agent:custom', 'agent:default',
-  'agent:builtin', 'compact', 'hook_agent', 'hook_prompt',
-  'verification_agent', 'side_question', 'auto_mode',
-  // ...
-])
-function shouldRetry529(querySource: QuerySource | undefined): boolean {
-  return querySource === undefined || FOREGROUND_529_RETRY_SOURCES.has(querySource)
-}
-```
-
-后台任务（summary 生成、title 生成、suggestion 生成）不在此白名单中，所以遇到 529 直接放弃。这个设计背后的逻辑是：**在一次 capacity cascade 中，每次重试都是 3-10 倍的 gateway 放大量。** 放弃后台任务的重试，是为前台用户请求让路。
-
-同样值得注意：529 最多重试 3 次后触发 fallback（切换到备用模型），但 fallback 本身可能带来 cache 丢失。这是一个典型的"两害相权"：切换模型丢 cache（需要多花一笔 cache write 费用），但继续等高概率也等不到（已经 3 次 529 了）。
-
 ---
 
 ## 3. 源码解读
@@ -276,57 +274,55 @@ function shouldRetry529(querySource: QuerySource | undefined): boolean {
 
 ### 3.2 完整调用链
 
-以一次用户输入 `"+500k"` 为起点，贯穿整条 Token 管理链路的完整流程：
+以一次用户输入 `"+500k"` 为起点，贯穿整条 Token 管理链路的完整流程。每条 Token 子系统的触发标注了它在 [06 §3.2](../part2/06-Agent-Loop机制#_3-2-完整调用链路) `queryLoop` 迭代体中的对应相位：
 
 ```
 用户输入 "+500k"
   │
-  ├─ 启动阶段
+  ├─ 启动阶段（06 queryLoop 入口之前）
   │   └─ tokenBudget.parseTokenBudget("+500k")
   │       → 解析为 500,000 token 的 budget 值
   │       → 传入 queryLoop，BudgetTracker 初始化
   │
   └─ 每轮循环
       ├─ [预测] tokenEstimation.countMessagesTokensWithAPI()
+      │   【相位：06 [预处理] 5步流水线入口】
       │   → 压缩决策需要"事前"上下文大小
       │   → Anthropic → Bedrock → Vertex → rough 四层 fallback
       │
-      ├─ [API 调用] deps.callModel()
-      │   └─ withRetry() 包裹
-      │       ├─ checkMockRateLimitError()（ANT-ONLY 测试用）
-      │       ├─ 529 → 最多 3 次，超限触发 fallback model
-      │       ├─ 429 → 等待 Retry-After
-      │       ├─ ECONNRESET/EPIPE → 退避 + 禁用 keep-alive
-      │       └─ 非交互场景 → 529 直接放弃
+      ├─ [重试控制] deps.callModel() → withRetry() 包裹
+      │   【相位：06 [★ 核心] deps.callModel() 内部】
+      │   ├─ 529 → 最多 3 次，超限触发 fallback model
+      │   ├─ 429 → 等待 Retry-After
+      │   └─ 非交互场景 → 529 直接放弃（成本保护）
       │   └─ API response 返回
       │       ├─ message.usage（事后精确数据）
       │       └─ response headers（速率限制状态）
       │
-      ├─ [度量] tokens.getTokenUsage(message)
-      │   └─ 过滤 SYNTHETIC_MESSAGES 和 SYNTHETIC_MODEL
+      ├─ [通知] claudeAiLimits.extractQuotaStatusFromHeaders(headers)
+      │   【相位：06 流式消费完成后】
+      │   → 解析 rate limit 响应头，更新 currentLimits 状态
+      │   → emitStatusChange() 通知所有 listener
       │
-      ├─ [度量] tokens.tokenCountWithEstimation(messages)
-      │   └─ 从最后一条 API response 的 usage 出发
-      │   └─ + roughTokenCountEstimationForMessages(新增消息)
-      │   └─ 并行 tool 场景：向前回溯到第一个 split sibling
+      ├─ [度量] tokens.getTokenUsage(message) + tokenCountWithEstimation(messages)
+      │   【相位：06 流式消费完成后】
+      │   → 从最后一条 API response 的 usage 出发
+      │   → 并行 tool 场景：向前回溯到第一个 split sibling（§3.3）
       │
       ├─ [控制] tokenBudget.checkTokenBudget(tracker, agentId, budget, turnTokens)
-      │   └─ agentId 存在 → 跳过（子智能体不继承预算）
-      │   └─ 判定 Continue（发 nudging）或 Stop（产出 completionEvent）
-      │
-      ├─ [通知] claudeAiLimits.extractQuotaStatusFromHeaders(headers)
-      │   └─ 解析 rate limit 响应头
-      │   └─ 更新 currentLimits 状态（allowed / allowed_warning / rejected）
-      │   └─ emitStatusChange() 通知所有 listener
-      │
-      └─ [通知] rateLimitMessages.getRateLimitMessage(limits, model)
-          └─ 根据 limits.status 生成用户可见消息
-          └─ severity: error（阻断性）或 warning（提示性）
+      │   【相位：06 [!needsFollowUp] 分支 → Token Budget 判定（出口⑤）】
+      │   → agentId 存在 → 跳过（子智能体不继承预算）
+      │   → 判定 Continue（发 nudging）或 Stop（产出 completionEvent）
 
-循环结束
+      └─ [通知] rateLimitMessages.getRateLimitMessage(limits, model)
+          【相位：06 循环内任意时刻，由 emitStatusChange 事件驱动】
+          → 根据 limits.status 生成用户可见消息
+
+循环结束（06 Terminal 出口）
   │
-  └─ [度量] modelCost.calculateUSDCost(model, usage)
-      └─ getModelCosts(model, usage) → 匹配定价阶梯
+  └─ [度量(事后)] modelCost.calculateUSDCost(model, usage)
+      【相位：06 queryLoop return 之后，回到外层 QueryEngine】
+      → getModelCosts(model, usage) → 匹配定价阶梯
       └─ tokensToUSDCost(costs, usage) → USD 金额
       └─ 显示给具有 billing 权限的用户
 ```
