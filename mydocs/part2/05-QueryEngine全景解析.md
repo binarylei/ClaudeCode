@@ -739,8 +739,7 @@ if (!isResultSuccessful(result, lastStopReason)) {
 
 - 本文覆盖的是 QueryEngine 的**架构全景**——模块划分、调用链路、关键设计决策。以下主题在后续章节中深入：
   - Agent Loop 的微观机制（预处理流水线、恢复路径、Continue/Terminal 状态机）→ [第 6 章](../part2/06-Agent-Loop机制)
-  - 流式响应的解析与消费、Extended Thinking 集成 → [第 7 章](../part2/07-流式响应与思考模式)
-  - Token 计数的精确机制、cost-tracker 设计、预算控制 → [第 8 章](../part2/08-Token与成本管理)
+  - Token 计数的精确机制、cost-tracker 设计、预算控制 → [第 7 章](../part2/07-Token与成本管理)
 - 工具执行机制（`runTools`、权限判定、工具注册）见 Part 3 工具系统系列。
 - 上下文压缩的算法细节（autoCompact / microCompact / snipCompact / reactiveCompact）见 Part 6 上下文管理系列。
 - REPL 交互层的 `ask()` 函数是 QueryEngine 的便捷包装，它额外处理了 REPL 特有的 snip replay 和 fileStateCache 同步，详见 Part 9 Bridge 与终端交互系列。

@@ -1,6 +1,8 @@
 import { defineConfig } from 'vitepress'
+import { withMermaid } from 'vitepress-plugin-mermaid'
 
-export default defineConfig({
+export default withMermaid(
+  defineConfig({
   title: 'ClaudeCode 源码分析',
   description: '以 Harness 工程视角深度解读 Claude Code 源码',
   lang: 'zh-CN',
@@ -35,8 +37,7 @@ export default defineConfig({
         items: [
           { text: '05. QueryEngine 全景解析', link: '/part2/05-QueryEngine全景解析' },
           { text: '06. Agent Loop 机制', link: '/part2/06-Agent-Loop机制' },
-          { text: '07. 流式响应与思考模式', link: '/part2/07-流式响应与思考模式' },
-          { text: '08. Token 与成本管理', link: '/part2/08-Token与成本管理' },
+          { text: '07. Token 与成本管理', link: '/part2/07-Token与成本管理' },
         ],
       },
       {
@@ -139,4 +140,9 @@ export default defineConfig({
       copyright: '© 2026',
     },
   },
-})
+
+  // Mermaid 配置（可选，插件会自适应亮/暗主题）
+  mermaid: {
+    theme: 'default',
+  },
+}))
