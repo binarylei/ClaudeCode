@@ -72,33 +72,34 @@ Agent 系统（累积计费）：
 
 ### 2.1 总览：四维在 queryLoop 中的挂载点
 
-在深入各维度的设计之前，先将四个子系统标注到[第 6 章](../part2/06-Agent-Loop机制)建立的 `queryLoop` 迭代体上。🔵 表示 06 已建立的循环结构，🔴 表示本章子系统的触发位置：
+在深入各维度的设计之前，先将四个子系统标注到[第 6 章](../part2/06-Agent-Loop机制)建立的 `queryLoop` 迭代体上。🔵 是 06 已建立的循环结构，🔴 是本章子系统的挂载点：
 
 ```mermaid
-flowchart LR
-    PRE["🔵 预处理"] --> CALL["🔵 callModel"]
-    CALL --> STREAM["🔵 流式消费"]
-    STREAM --> BRANCH{"🔵 分支"}
-    BRANCH -->|"tools"| TOOLS["🔵 工具执行"] --> PRE
-    BRANCH -->|"end"| TERM["🔵 Terminal"]
-    PRE -.- P1["🔴 预测"]
-    CALL -.- P2["🔴 重试控制\n🔴 通知"]
-    STREAM -.- P3["🔴 度量"]
-    BRANCH -.- P4["🔴 预算控制"]
-    TERM -.- P5["🔴 事后度量"]
+flowchart TD
+    A["🔵 ① 预处理<br/>🔴 预测"] --> B["🔵 ② callModel<br/>🔴 重试控制"]
+    B --> C["🔵 ③ 流式消费<br/>🔴 度量 · 通知"]
+    C --> D{"🔵 ④ needsFollowUp?"}
+    D -->|tool_use| E["🔵 ⑤ 工具执行"]
+    E -->|下一轮| A
+    D -->|end_turn| F{"🔴 ⑥ BudgetTracker"}
+    F -->|Continue| A
+    F -->|Stop| G(["🔵 Terminal"])
+    G --> H["🔴 ⑦ 事后度量"]
 ```
 
-具体映射关系：
+图上 ①~⑦ 中 🔴 标注的 6 个挂载点，按四维归类如下：
 
-- **预测** 在预处理流水线入口触发（每次调 API 之前），判断是否需要压缩，消费方是 06 §3.4 的 5 步减法流水线。
-- **度量** 在 `callModel` 返回后触发，从 `message.usage` 提取精确数据，合并新消息的粗略估算，供 `tokenCountWithEstimation()` 的所有调用点使用。
-- **重试控制** 在 `withRetry` 内部触发（529/429/网络错误），决定是否重试以及何种策略，消费方是 06 §3.7 的重试层。
-- **预算控制** 在 `!needsFollowUp` 分支触发（模型无工具调用、准备终止时），判定 Continue 还是 Stop，消费方是 06 §3.5 的 Continue/Terminal 状态机。
-- **通知** 在 `callModel` 返回后触发，解析速率限制响应头，更新 `currentLimits` 状态，输出到 UI 渲染和 status line 脚本。
-- **事后度量** 在循环结束后触发，汇总全部 usage 匹配定价计算 USD，展示给具有 billing 权限的用户。
+| 维度 | 图上位置 | 触发时机 | 核心逻辑 | 消费方 |
+|------|---------|----------|---------|--------|
+| 预测 | ① 预处理 | 每次 API 调用前 | token 估算 → 判断是否压缩 | 06 §3.4 的 5 步减法流水线 |
+| 控制（重试） | ② callModel | API 返回 529/429/网络错误 | withRetry 分层策略 → 重试或放弃 | 06 §3.7 的重试层 |
+| 度量 | ③ 流式消费 | API 返回成功 | 提取 usage + `tokenCountWithEstimation()` | 所有调用点 |
+| 通知 | ③ 流式消费 | API 返回成功 | 解析限流头 → `emitStatusChange()` | UI 组件 + status line |
+| 控制（预算） | ⑥ BudgetTracker | 模型无工具调用时 | 收益递减检测 → Continue / Stop | 06 §3.5 状态机 |
+| 度量（事后） | ⑦ 循环结束 | `queryLoop` return 后 | usage 匹配定价 → USD | billing 权限用户 |
 
 ::: tip 关键洞察
-Token 管理的四个子系统不改变 `while(true)` 的结构——它们作为**观察者和守卫**嵌入在循环相位中。预测是"进门守卫"（进去之前看一眼），度量是"账房"（每笔交易后记账），控制是"刹车"（条件满足时终止循环），通知是"仪表盘"（实时显示当前状态）。
+Token 管理的四个子系统不改变 `while(true)` 的结构——它们作为**观察者和守卫**嵌入在循环相位中。预测是"进门守卫"（进去之前看一眼），度量是"账房"（每笔交易后记账），控制是"刹车"（两个层面：withRetry 处理 API 层故障，BudgetTracker 处理预算层终止），通知是"仪表盘"（实时显示当前状态）。
 :::
 
 ### 2.2 度量层：为什么需要"精确计数 + 粗略估算"双轨制？
