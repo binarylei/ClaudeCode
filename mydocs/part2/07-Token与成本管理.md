@@ -1,12 +1,12 @@
 ---
 title: "07. Token 与成本管理"
-description: "Token 计数机制、cost-tracker 设计、预算控制与速率限制"
+description: "Token 计数机制、cost-tracker 设计、预算控制（BudgetTracker 状态机、分层退出拦截器链、query.ts 协作）、速率限制"
 outline: [2, 3]
 ---
 
 # 07. Token 与成本管理
 
-本章回答 Part 2 核心循环的第三个问题：05 讲架构全貌（WHERE），06 讲循环怎么转（HOW），本章讲循环中流淌的"血液"——Token——如何计量和控制（HOW MUCH）。全文围绕 **度量 → 预测 → 控制 → 通知** 四个环节展开，覆盖 9 个核心文件约 2,900 行源码。
+本章回答 Part 2 核心循环的第三个问题：05 讲架构全貌（WHERE），06 讲循环怎么转（HOW），本章讲循环中流淌的"血液"——Token——如何计量和控制（HOW MUCH）。全文围绕 **度量 → 控制** 两个环节展开。
 
 ## 1. 背景介绍
 
@@ -40,66 +40,59 @@ Agent 系统（累积计费）：
 
 两种极端的折衷方案是 **分级预警 + 收益递减检测 + 可配置硬上限**：让模型在预算内"尽力跑"，但在接近限制时给出提示，在明显空转时果断刹车。这就是本章要讲的完整闭环。
 
-### 1.3 正交分解：四个子问题
+### 1.3 正交分解：两个核心问题
 
-将"Token 与成本管理"正交分解为四个独立维度:
+将"Token 与成本管理"正交分解为两个独立维度：
 
 ```
                      "每个 token 都有成本"
 
      度量 (MEASURE)                    控制 (CONTROL)
- ┌────────────────────────┐      ┌────────────────────────────┐
- │ 实际用了多少 token？     │     │ 什么时候该停？               │
- │ · API usage 精确提取    │      │ · max_budget_usd 硬上限     │
- │ · 上下文窗口实时大小     │      │ · BudgetTracker 收益递减检测 │
- │ · 并行 tool 调用去重估算 │      │ · max_turns 回合限制        │
- └────────────────────────┘      └────────────────────────────┘
-
-     预测 (PREDICT)                    通知 (INFORM)
- ┌────────────────────────┐      ┌────────────────────────────┐
- │ 调用 API 前用多少？      │      │ 什么时候告诉用户？           │
- │ · 跨提供商 token 估算    │     │ · 5h / 7d / overage 三层配额 │
- │ · rough estimation 兜底 │     │ · 提前预警阈值               │
- │ · thinking block 感知   │     │ · 成本显示权限控制            │
- └────────────────────────┘      └────────────────────────────┘
+ ┌──────────────────────────────┐  ┌──────────────────────────────┐
+ │ 实际用了多少 token？           │  │ 什么时候该停？                 │
+ │ · API usage 精确提取（事后）    │  │ · BudgetTracker 收益递减检测   │
+ │ · 跨提供商 token 估算（事前）   │  │ · max_budget_usd / max_turns  │
+ │ · 上下文窗口实时大小计算        │  │ · withRetry 分层重试策略       │
+ │ · 并行 tool 调用去重估算       │  │ · 分层退出拦截器链定位          │
+ │ · usage → USD 成本换算        │  └──────────────────────────────┘
+ └──────────────────────────────┘
 ```
 
-这四个模块互相独立又环环相扣：度量提供数据基础，预测填补 API 调用前的时间窗口，控制基于度量结果做决策，通知把控制决策翻译成用户可理解的语言。具体每个模块如何嵌入 Agent Loop 的迭代体、各自面临什么设计约束，是第 2 节要回答的问题。
+两个模块互相独立又环环相扣：度量提供数据基础——事后精确计数校准基准，事前估算填补 API 调用前的时间窗口；控制基于度量结果做决策——预算超了要刹车，模型空转了要止损。具体每个模块如何嵌入 Agent Loop 的迭代体、各自面临什么设计约束，是第 2 节要回答的问题。
 
 ---
 
 ## 2. 核心逻辑
 
-### 2.1 总览：四维在 queryLoop 中的挂载点
+### 2.1 总览：二维在 queryLoop 中的挂载点
 
-在深入各维度的设计之前，先将四个子系统标注到[第 6 章](../part2/06-Agent-Loop机制)建立的 `queryLoop` 迭代体上。🔵 是 06 已建立的循环结构，🔴 是本章子系统的挂载点：
+在深入各维度的设计之前，先将两个子系统标注到[第 6 章](../part2/06-Agent-Loop机制)建立的 `queryLoop` 迭代体上。🔵 是 06 已建立的循环结构，🔴 是本章子系统的挂载点：
 
 ```mermaid
 flowchart TD
-    A["🔵 ① 预处理<br/>🔴 预测"] --> B["🔵 ② callModel<br/>🔴 重试控制"]
-    B --> C["🔵 ③ 流式消费<br/>🔴 度量 · 通知"]
+    A["🔵 ① 预处理<br/>🔴 度量·事前估算"] --> B["🔵 ② callModel<br/>🔴 控制·重试"]
+    B --> C["🔵 ③ 流式消费<br/>🔴 度量·事后计数"]
     C --> D{"🔵 ④ needsFollowUp?"}
     D -->|tool_use| E["🔵 ⑤ 工具执行"]
     E -->|下一轮| A
-    D -->|end_turn| F{"🔴 ⑥ BudgetTracker"}
+    D -->|end_turn| F{"🔴 ⑥ BudgetTracker<br/>控制·预算"}
     F -->|Continue| A
     F -->|Stop| G(["🔵 Terminal"])
-    G --> H["🔴 ⑦ 事后度量"]
+    G --> H["🔴 ⑦ 度量·成本换算"]
 ```
 
-图上 ①~⑦ 中 🔴 标注的 6 个挂载点，按四维归类如下：
+图上 ①~⑦ 中 🔴 标注的 6 个挂载点，按二维归类如下：
 
 | 维度 | 图上位置 | 触发时机 | 核心逻辑 | 消费方 |
 |------|---------|----------|---------|--------|
-| 预测 | ① 预处理 | 每次 API 调用前 | token 估算 → 判断是否压缩 | 06 §3.4 的 5 步减法流水线 |
+| 度量（事前） | ① 预处理 | 每次 API 调用前 | token 估算 → 判断是否压缩 | 06 §3.4 的 5 步减法流水线 |
+| 度量（事后） | ③ 流式消费 | API 返回成功 | 提取 usage + `tokenCountWithEstimation()` | 所有调用点 |
+| 度量（成本） | ⑦ 成本换算 | `callModel()` 内部，收到 usage 后立即 | usage 匹配定价 → USD，实时累加 | billing 权限用户 |
 | 控制（重试） | ② callModel | API 返回 529/429/网络错误 | withRetry 分层策略 → 重试或放弃 | 06 §3.7 的重试层 |
-| 度量 | ③ 流式消费 | API 返回成功 | 提取 usage + `tokenCountWithEstimation()` | 所有调用点 |
-| 通知 | ③ 流式消费 | API 返回成功 | 解析限流头 → `emitStatusChange()` | UI 组件 + status line |
 | 控制（预算） | ⑥ BudgetTracker | 模型无工具调用时 | 收益递减检测 → Continue / Stop | 06 §3.5 状态机 |
-| 度量（事后） | ⑦ 循环结束 | `queryLoop` return 后 | usage 匹配定价 → USD | billing 权限用户 |
 
 ::: tip 关键洞察
-Token 管理的四个子系统不改变 `while(true)` 的结构——它们作为**观察者和守卫**嵌入在循环相位中。预测是"进门守卫"（进去之前看一眼），度量是"账房"（每笔交易后记账），控制是"刹车"（两个层面：withRetry 处理 API 层故障，BudgetTracker 处理预算层终止），通知是"仪表盘"（实时显示当前状态）。
+Token 管理的两个子系统不改变 `while(true)` 的结构——它们作为**观察者和守卫**嵌入在循环相位中。度量是"账房"——事前估算在进门时把关（压缩决策），事后计数在每笔交易后记账（上下文窗口校准），最终在结束时结算（成本换算）。控制是"刹车"——两个层面：withRetry 处理 API 层故障，BudgetTracker 处理预算层终止。
 :::
 
 ### 2.2 度量层：为什么需要"精确计数 + 粗略估算"双轨制？
@@ -145,7 +138,7 @@ flowchart LR
 在 Token 管理的设计空间中，"一致性"比"精确性"更重要。上下文窗口是否真的 199k token 不重要，重要的是**每次判断用的都是同一把尺子**。否则会出现"压缩判断认为没到阈值，实际 API 调用却报溢出"的不一致。
 :::
 
-### 2.3 预测层：为什么是四层 Fallback？
+**事前估算管线的四层 Fallback**
 
 度量层的"事前估算"路径，本质是一个跨提供商的 token 估算管线：
 
@@ -191,9 +184,11 @@ export function bytesPerTokenForFileType(fileExtension: string): number {
 `bytesPerTokenForFileType` 的设计说明了一个原则：**粗略估算不等于"随便估"。** 在关键决策点（工具结果截断判断），即使 2 行 switch-case，也能把误差从 50% 降到 25%。
 :::
 
-### 2.4 控制层：BudgetTracker 的"收益递减"哲学
+### 2.3 控制层：BudgetTracker 的"收益递减"哲学与分层退出模型
 
-如果用户设置了预算（如 `+500k`），Agent Loop 的每一轮都需要回答：**模型还在"有效工作"还是"已经空转"？**
+如果用户设置了预算（如 `+500k`），Agent Loop 的每一轮都需要回答两个问题：**模型还在"有效工作"还是"已经空转"**，以及**应该在循环的哪个节点介入**。
+
+#### 2.3.1 收益递减检测：为什么是 90% + 连续 3 轮？
 
 Claude Code 的答案封装在 `BudgetTracker` 状态机中：
 
@@ -223,110 +218,150 @@ flowchart TD
 - 第 2 轮低产出：可能在思考如何修改（thinking block 较长但实际 text 增量小）
 - 第 3 轮还在低产出：大概率是"卡住了"——在同一个问题上反复徘徊
 
-### 2.5 速率限制：为什么分成 5h / 7d / overage 三层？
+#### 2.3.2 为什么在 `!needsFollowUp` 之后介入？
 
-速率限制（Rate Limiting）和预算控制是两回事：预算是"用户层面的成本控制"，速率限制是"服务端的资源保护"。但两者共享同一个信息通道——API 响应头。
+理解了 BudgetTracker **如何**判定之后，下一个问题是 **在哪判定**。回到[第 6 章](../part2/06-Agent-Loop机制)建立的 queryLoop 结构，BudgetTracker 的判定点位于 `!needsFollowUp` 分支内部——即模型**本轮没有 tool_use** 时。这个位置选择包含一个关键洞察：
 
-Claude Code 将服务端速率限制映射为三层结构：
+> **`!needsFollowUp` 只表示"模型本轮没有发出 tool_use"，不等于"任务完成"。**
 
-| 层级 | 窗口 | 作用 | 预警策略 |
-|------|------|------|---------|
-| five_hour | 5 小时 | 短期突发保护 | 用量 ≥ 90% 且时间经过 ≥ 72% → 预警 |
-| seven_day | 7 天 | 中期平滑限制 | 三级预警：75%+60%、50%+35%、25%+15% |
-| overage | 按月 | 超额使用兜底 | 独立判断，与 5h/7d 互不干扰 |
+用一个具体场景说明。用户输入：
 
-为什么预警不是简单的"用量 > 80% 就警告"？关键洞察在 `EarlyWarningThreshold` 的数据结构：
+> `+500k 请审计整个项目的安全问题，输出详细报告`
+
+然后发生：
+
+```
+轮 1: 模型调 Grep 搜索 SQL 注入 → 产出 15k token → stop_reason=end_turn
+      模型说："我发现了 3 个 SQL 注入漏洞，任务完成。"
+      !needsFollowUp = true
+      → 如果此时直接退出，500k 的预算只用了 3%
+```
+
+模型在第 1 轮就宣布"完成"不是因为它偷懒——LLM 没有预算意识。它不知道用户给了 500k token 的配额，它只是按自己的判断给出了它认为合理的答案。用户付了 500k token 的钱，只得到了 15k token 的产出，这不是模型的问题，而是**系统没有把预算进度注入模型的决策循环**。
+
+BudgetTracker 的解决方案是：在模型说"我完成了"的时候，检查预算使用进度。如果只用了一小部分，就注入一条 nudge 消息让模型继续：
 
 ```typescript
-// src/services/claudeAiLimits.ts:38-41
-type EarlyWarningThreshold = {
-  utilization: number // 0-1 scale: trigger warning when usage >= this
-  timePct: number     // 0-1 scale: trigger warning when time elapsed <= this
+// src/utils/tokenBudget.ts:66-73
+export function getBudgetContinuationMessage(
+  pct: number, turnTokens: number, budget: number,
+): string {
+  const fmt = (n: number): string => new Intl.NumberFormat('en-US').format(n)
+  return `Stopped at ${pct}% of token target (${fmt(turnTokens)} / ${fmt(budget)}). Keep working — do not summarize.`
 }
 ```
 
-这是一个二维判定：**用量和时间必须同时满足条件才触发预警。** 用量 75% 但时间已经过了 90% → 不预警（消耗速度实际上偏慢）。用量 25% 但时间只过了 15% → 预警（消耗速度偏快，按此趋势会提前耗尽）。
+最后一句 `**Keep working — do not summarize.**` 的措辞非常精准——设计者知道模型此时的行为倾向是"对已完成的工作做总结"，所以明确禁止 `summarize`。如果模型只是把之前的发现重新措辞说一遍，那就浪费了续命的 token。
 
-这是对传统"80% 就告警"的一次升级：将静态阈值变成了**动态速率感知**。同样的用量百分比，在不同的时间进度下，意味着完全不同的风险级别。
+#### 2.3.3 退出拦截器：BudgetTracker 为什么排在最后？
 
-seven_day 的三级预警更细腻——它在 75%、50%、25% 三个水位各设置了一个时间-用量交叉点，形成一条"预警曲线"。用户不会在 74% 时什么都不知道、75% 时突然收到严重警告，而是随着消耗加速逐步收到越来越紧迫的提示。
+回到[第 6 章](../part2/06-Agent-Loop机制)建立的 queryLoop 结构：当模型本轮没有 `tool_use` 时（`!needsFollowUp`），系统并非直接退出——在 `return { reason: 'completed' }` 之前，还排列着多层"退出拦截器"。BudgetTracker 是这条拦截器链上的**最后一环**：
 
----
+```
+!needsFollowUp
+  → ① 413 恢复检测       ← 技术故障，不是真的完成（详见第 6 章）
+  → ② max_output_tokens 恢复 ← API 截断，不是模型想停（详见第 6 章）
+  → ③ stopHooks           ← 外部规则阻止（详见 Part 8）
+  → ④ BudgetTracker       ← 经济约束："预算用完了吗？"
+  → return completed
+```
+
+前三层拦截器（详见第 6 章）处理"非正常退出"——系统或外部原因导致的中断。BudgetTracker 处理的则是另一种情况：**模型正常表达了"我完成了"，但预算还没用完**。
+
+这说明 BudgetTracker 是 **预算维度的守卫**——如果 `feature('TOKEN_BUDGET')` 为 false，这一层直接不存在，循环在 stopHooks 之后正常退出
+
+::: tip 关键洞察
+BudgetTracker 解决的核心问题是 LLM 的"预算盲区"——模型不知道用户给了多少配额，它按自己的判断说"完成"。BudgetTracker 通过 nudge 消息把预算进度注入模型的下一轮输入。更深层地看，`!needsFollowUp` 不是"任务完成"的同义词——它是模型的**建议**，而非系统的**决策**。当预算未耗尽时，即使模型认为完成了，系统也选择继续——这是一种**经济驱动的循环扩展**。
+:::
 
 ## 3. 源码解读
 
 ### 3.1 核心文件清单
 
-| 文件 | 行数 | 职责 | 所属层次 |
-|------|------|------|---------|
-| [`src/utils/tokens.ts`](../../src/utils/tokens.ts) | 261 | Usage 提取、上下文窗口计算、并行 tool 去重、content 长度估算 | 度量 |
-| [`src/services/tokenEstimation.ts`](../../src/services/tokenEstimation.ts) | 495 | 跨提供商 token 计数 API、rough estimation 兜底、文件类型感知 | 预测 |
-| [`src/utils/modelCost.ts`](../../src/utils/modelCost.ts) | 231 | 定价阶梯（6 个 tier）、usage → USD 转换、未知模型兜底 | 度量 |
-| [`src/services/api/usage.ts`](../../src/services/api/usage.ts) | 63 | 从 OAuth API 拉取配额使用率（5h/7d/overage） | 通知 |
-| [`src/utils/tokenBudget.ts`](../../src/utils/tokenBudget.ts) | 73 | 用户预算指令解析（`+500k`、`use 2M tokens`）、续命提示文案 | 控制 |
-| [`src/query/tokenBudget.ts`](../../src/query/tokenBudget.ts) | 93 | BudgetTracker 状态机：Continue/Stop 判定、收益递减检测 | 控制 |
-| [`src/services/api/withRetry.ts`](../../src/services/api/withRetry.ts) | 822 | 重试引擎：529/429/网络错误分层策略、fast mode fallback | 控制 |
-| [`src/services/claudeAiLimits.ts`](../../src/services/claudeAiLimits.ts) | 515 | 速率限制检测：header 解析、提前预警、三层配额、配额检查 API | 通知 |
-| [`src/services/rateLimitMessages.ts`](../../src/services/rateLimitMessages.ts) | 344 | 用户可见速率限制消息生成，严重度分级 error/warning | 通知 |
+| 文件 | 行数 | 职责 |
+|------|------|------|
+| [`src/query/tokenBudget.ts`](../../src/query/tokenBudget.ts) | 93 | BudgetTracker 状态机：Continue/Stop 判定、收益递减检测 |
+| [`src/utils/tokens.ts`](../../src/utils/tokens.ts) | 261 | Usage 提取、上下文窗口计算、并行 tool 去重 |
+| [`src/services/tokenEstimation.ts`](../../src/services/tokenEstimation.ts) | 495 | 跨提供商 token 计数、rough estimation 兜底、文件类型感知 |
+| [`src/utils/tokenBudget.ts`](../../src/utils/tokenBudget.ts) | 73 | 预算指令解析（`+500k`）、nudge 提示文案 |
 
 ### 3.2 完整调用链
 
-以一次用户输入 `"+500k"` 为起点，贯穿整条 Token 管理链路的完整流程。每条 Token 子系统的触发标注了它在 [06 §3.2](../part2/06-Agent-Loop机制#_3-2-完整调用链路) `queryLoop` 迭代体中的对应相位：
+以一次用户输入 `"+500k"` 为起点，贯穿整条 Token 管理链路的完整流程。括号内为 [06 §3.2](../part2/06-Agent-Loop机制#_3-2-完整调用链路) `queryLoop` 中的对应节点：
 
 ```
 用户输入 "+500k"
   │
-  ├─ 启动阶段（06 queryLoop 入口之前）
-  │   └─ tokenBudget.parseTokenBudget("+500k")
-  │       → 解析为 500,000 token 的 budget 值
-  │       → 传入 queryLoop，BudgetTracker 初始化
+  ├─ 启动阶段（queryLoop 入口之前）
+  │   └─ parseTokenBudget("+500k") → budget = 500000
+  │      解析用户预算指令（+500k/$5/50%），提取 token 总额度
   │
   └─ 每轮循环
-      ├─ [预测] tokenEstimation.countMessagesTokensWithAPI()
-      │   【相位：06 [预处理] 5步流水线入口】
-      │   → 压缩决策需要"事前"上下文大小
-      │   → Anthropic → Bedrock → Vertex → rough 四层 fallback
+      ├─ [预处理阶段] tokenCountWithEstimation(messagesForQuery)
+      │   Token 预估，计算当前上下文 token 数，用于 blocking limit 和压缩阈值判定
       │
-      ├─ [重试控制] deps.callModel() → withRetry() 包裹
-      │   【相位：06 [★ 核心] deps.callModel() 内部】
-      │   ├─ 529 → 最多 3 次，超限触发 fallback model
-      │   ├─ 429 → 等待 Retry-After
-      │   └─ 非交互场景 → 529 直接放弃（成本保护）
-      │   └─ API response 返回
-      │       ├─ message.usage（事后精确数据）
-      │       └─ response headers（速率限制状态）
+      ├─ [*模型调用] deps.callModel() → withRetry()
+      │   ├─ 529（服务端过载）→ 连续 3 次后触发 fallback；非交互模式直接放弃
+      │   ├─ 429（速率限制）→ fast mode 按 Retry-After 长短分流等待策略
+      │   └─ 返回 usage → calculateUSDCost() 实时累加会话总成本
       │
-      ├─ [通知] claudeAiLimits.extractQuotaStatusFromHeaders(headers)
-      │   【相位：06 流式消费完成后】
-      │   → 解析 rate limit 响应头，更新 currentLimits 状态
-      │   → emitStatusChange() 通知所有 listener
-      │
-      ├─ [度量] tokens.getTokenUsage(message) + tokenCountWithEstimation(messages)
-      │   【相位：06 流式消费完成后】
-      │   → 从最后一条 API response 的 usage 出发
-      │   → 并行 tool 场景：向前回溯到第一个 split sibling（§3.3）
-      │
-      ├─ [控制] tokenBudget.checkTokenBudget(tracker, agentId, budget, turnTokens)
-      │   【相位：06 [!needsFollowUp] 分支 → Token Budget 判定（出口⑤）】
-      │   → agentId 存在 → 跳过（子智能体不继承预算）
-      │   → 判定 Continue（发 nudging）或 Stop（产出 completionEvent）
-
-      └─ [通知] rateLimitMessages.getRateLimitMessage(limits, model)
-          【相位：06 循环内任意时刻，由 emitStatusChange 事件驱动】
-          → 根据 limits.status 生成用户可见消息
-
-循环结束（06 Terminal 出口）
-  │
-  └─ [度量(事后)] modelCost.calculateUSDCost(model, usage)
-      【相位：06 queryLoop return 之后，回到外层 QueryEngine】
-      → getModelCosts(model, usage) → 匹配定价阶梯
-      └─ tokensToUSDCost(costs, usage) → USD 金额
-      └─ 显示给具有 billing 权限的用户
+      └─ [预算拦截] checkTokenBudget(tracker, agentId, budget, turnTokens)
+          预算状态机判定：子智能体跳过；其余按消耗比例 + 收益递减检测
+          → Continue（注入 nudge 提示继续）/ Stop（任务完成或收益递减）
 ```
 
-### 3.3 并行工具调用的 Token 去重算法
+### 3.3 Token 预估算法
 
-上下文窗口计算中最微妙的场景是并行工具调用。当模型在一个 response 中发出多个 `tool_use` block 时，流式代码会为每个 content block 生成**独立的 assistant 消息记录**——但它们共享同一个 `message.id` 和 `usage`。如果直接从 messages 数组末尾向前找最后一个有 usage 的 assistant，会遗漏前面的 interleaved tool_results：
+`tokenCountWithEstimation()` 是上下文窗口大小计算的**唯一权威入口**。所有阈值判断（autocompact、session memory 初始化等）都通过它获取当前上下文大小，确保"每次判断用的是同一把尺子"。
+
+它的核心公式只有一行：
+
+```
+当前上下文 token 数 = 精确值 + 估算增量
+```
+
+下面先拆解这两个加数，再分析确定分界线位置时的一个关键边界情况 — 并行工具调用导致的分界线偏移。
+
+```
+[msg0, msg1, msg2, msg3, msg4, msg5, msg6, msg7]
+                          ↑                ↑
+                最后一次 API 响应        最新消息
+                (有 usage，精确)        (无 usage，估算)
+                i = 4
+```
+
+#### 3.3.1 精确值：`getTokenCountFromUsage(usage)`
+
+从最后一次 API 响应的 `usage` 对象中提取真实 token 数：
+
+```
+input_tokens + cache_creation_input_tokens
+  + cache_read_input_tokens + output_tokens
+```
+
+这四项分别对应：输入文本、写入 prompt cache、从 cache 读取、模型输出。API 返回的这些值是精确的，代表**那次调用时**上下文窗口的真实大小。每次 API 调用后，这个值成为新的"校准基准"——之前的估算误差在此清零。
+
+#### 3.3.2 估算增量：`roughTokenCountEstimationForMessages(messages.slice(i + 1))`
+
+`i` 是分界线所在消息的索引。`messages.slice(i + 1)` 取的是那次 API 调用之后**新增**的所有消息（tool_result、后续用户输入等）——这些消息尚未通过 API 发送，没有精确计数，只能用启发式估算。
+
+估算逻辑按消息内容类型分别处理（详见 `src/services/tokenEstimation.ts`）：
+
+```
+text / thinking / redacted_thinking → 字符数 / 4
+image / document                     → 固定 2000 token（保守估计）
+tool_use                             → (name + JSON.stringify(input)).length / 4
+tool_result                          → 递归展开 content 后累加
+其他未知类型                          → JSON.stringify(block).length / 4
+```
+
+估算增量部分必然有误差，但混合策略的关键优势在于**误差不会累积**：每次 API 调用后分界线重新校准，之前估算部分的误差被精确值覆盖。真正需要估算的只有两次 API 调用之间的"最新一小段"。
+
+#### 3.3.3 并行工具调用：分界线定位
+
+上述公式成立的前提是**分界线的索引 `i` 找对了**。大多数情况下这很简单——从消息数组尾部向前找到第一个携带 `usage` 的 assistant 消息即可。但并行工具调用场景会打破这个前提。
+
+当模型在一个 response 中发出多个 `tool_use` block 时，流式代码会为每个 content block 生成**独立的 assistant 消息记录**——但它们共享同一个 `message.id` 和 `usage`。查询循环会将每个 `tool_result` 立即**交错插入**在对应的 `tool_use` 之后：
 
 ```
 messages = [
@@ -336,10 +371,9 @@ messages = [
   assistant(id="A", tool_use="read"),   // ← 第二个 tool_use (同一个 API response)
   user(tool_result: "..."),             // ← 最后一个消息
 ]
-// 如果只从最后一个 assistant 开始估算，会遗漏第一个 tool_result
 ```
 
-`tokenCountWithEstimation()` 的解决方案是从最后一个 assistant 向前回溯，找到**同一个 API response 中的第一个 split sibling**：
+如果从最后一个 assistant（tool_use="read"）开始估算，只会统计它之后的一条 `tool_result`，遗漏前面交错的第一个 `tool_result`。解决方案是**从找到的 assistant 向前回溯**，定位到同一个 `message.id` 的最早兄弟记录：
 
 ```typescript
 // src/utils/tokens.ts:226-261
@@ -349,9 +383,7 @@ export function tokenCountWithEstimation(messages: readonly Message[]): number {
     const message = messages[i]
     const usage = message ? getTokenUsage(message) : undefined
     if (message && usage) {
-      // Walk back past any earlier sibling records split from the same API
-      // response (same message.id) so interleaved tool_results between them
-      // are included in the estimation slice.
+      // 并行工具调用处理：向前回退到同一 API response 的第一个 split
       const responseId = getAssistantMessageId(message)
       if (responseId) {
         let j = i - 1
@@ -359,17 +391,15 @@ export function tokenCountWithEstimation(messages: readonly Message[]): number {
           const prior = messages[j]
           const priorId = prior ? getAssistantMessageId(prior) : undefined
           if (priorId === responseId) {
-            // Earlier split of the same API response — anchor here instead.
-            i = j
+            i = j  // 锚定到更早的分片
           } else if (priorId !== undefined) {
-            // Hit a different API response — stop walking.
-            break
+            break  // 遇到不同的 API 响应，停止回退
           }
-          // priorId === undefined: a user/tool_result/attachment message,
-          // possibly interleaved between splits — keep walking.
+          // priorId === undefined：user/tool_result 消息，继续回退
           j--
         }
       }
+      // 核心公式：精确值 + 估算增量
       return (
         getTokenCountFromUsage(usage) +
         roughTokenCountEstimationForMessages(messages.slice(i + 1))
@@ -377,20 +407,40 @@ export function tokenCountWithEstimation(messages: readonly Message[]): number {
     }
     i--
   }
+  // 冷启动：没有任何 API 响应记录 → 全量估算
   return roughTokenCountEstimationForMessages(messages)
 }
 ```
 
+回溯逻辑的三种分支覆盖了消息数组的所有消息类型：
+
+| 遇到的消息类型 | `getAssistantMessageId` 返回值 | 行为 |
+|---------------|-------------------------------|------|
+| 同一个 API response 的兄弟 assistant | `=== responseId` | 分界线前移，继续回溯 |
+| 另一个 API response 的 assistant | `!== undefined` 且 `!== responseId` | 停止回溯 |
+| user / tool_result / attachment | `undefined` | 跳过，继续回溯 |
+
 **设计要点：**
 
-- **回溯而非扫描**：不遍历整个数组，而是从后往前找到第一个有 usage 的记录再回溯，大多数场景（无并行 tool）只需 O(1)
-- **`message.id` 作为分组键**：利用 API response 的天然唯一 ID，无需引入新的分组数据结构
-- **三种情况的分支清晰**：同 ID 继续回溯、不同 ID 停止、无 ID（user message）跳过——三个分支覆盖了 messages 数组的所有消息类型
-- **对"精度"的诚实态度**：回溯后用 `roughTokenCountEstimationForMessages` 而非精确计数——承认估算部分的误差，但保证不漏算
+- **"精确 + 估算"混合是核心策略**：精确值每次 API 调用后校准，估算增量只覆盖最新一小段，误差不累积。这是算法的主线——并行工具处理只是确保分界线位置正确的一个边界修正
+- **回溯的时间复杂度**：从数组末尾向前找到第一个 usage 后回溯，大多数场景（无并行 tool）无需回溯即 O(1)；有并行 tool 时回溯深度 = 同一 response 的 content block 数，通常 ≤ 5
+- **`message.id` 作为分组键**：利用 API response 的天然唯一 ID 标记同一批次的 assistant 记录，无需引入新的分组数据结构
+- **三种分支覆盖全部消息类型**：同 ID（继续回溯）、不同 ID（停止）、无 ID（跳过）——清晰且完备
+- **冷启动兜底**：当消息数组中完全没有任何 API 响应记录时（例如会话刚开始），对整个数组做纯估算——此时没有分界线可用，全量估算是唯一选择
+
+#### 3.3.4 从 token 到美元
+
+客户端成本计算在 `deps.callModel()` 内部，`claude.ts` 每次收到 API response 后调用 `calculateUSDCost(model, usage)`，与 usage 提取同步发生，queryLoop 不直接感知。
+
+**为什么需要客户端计算？** Anthropic API 的 response body 只有 token 计数（`input_tokens` / `output_tokens` 等），没有 `cost_usd` 字段。客户端必须维护定价表自己做乘法：token 数 × 单价 = 美元。它与 API 响应头中的配额百分比（`anthropic-ratelimit-unified-*-utilization`，详见 Part 8）定位不同：客户端算的是会话级实时成本（"这次对话花了多少钱"），配额百分比是窗口级剩余额度（"还剩多少可用"）。
 
 ### 3.4 BudgetTracker：Continue / Stop 决策
 
-预算控制的决策逻辑集中在一个 50 行的函数中。先看数据结构：
+预算控制子系统跨越 4 个文件，但核心决策逻辑集中在 `checkTokenBudget` 这一个 50 行的函数中。本节先解析决策逻辑本身，再展开与 `query.ts` 的完整协作链路。
+
+#### 3.4.1 数据结构与 checkTokenBudget 决策逻辑
+
+先看数据结构：
 
 ```typescript
 // src/query/tokenBudget.ts:1-11
@@ -463,105 +513,190 @@ export function checkTokenBudget(
 
 - **无预算时不介入**：子智能体消耗父任务 token 池，独立执行预算会双重计数；未设置则无控制目标。
 - **连续低产才判定空转**：单轮低产可能是读文件、等工具、深度思考——都是正常行为，不足以判定空转。`< 500` 而非 `= 0` 是因为即使卡住的模型也在产生 token（thinking、试探输出），真正的零产出不存在。
-- **Stop 分两档**：`> 0` 说明预算曾是活约束 — 模型被允许继续过，压力渐进累积，这是"预算在起作用"。`= 0` 且首次超 90% 说明任务在工具调用阶段已消耗大部分预算 — 长任务碰上紧预算，Token不够。
+- **Stop 分两档**：`> 0` 说明预算曾是活约束 — 模型被允许继续过，压力渐进累积，这是"预算在起作用"。`= 0` 且首次超 90% 说明任务在工具调用阶段已消耗大部分预算 — 长任务碰上紧预算，Token 不够。
 - **三个常量耦合调参**：`0.9`（阈值）、`500`（递减感知）、`3`（连续轮数）相互耦合——改任何一个都会改变"激进 vs 保守"的平衡点。
 
-### 3.5 成本计算：定价阶梯与 unknown model 兜底
+#### 3.4.2 BudgetTracker 与 query.ts 的完整协作链路
 
-将 `usage` 转成美元，需要两步：匹配定价阶梯 → 逐项计算。
+`checkTokenBudget` 是一个纯函数（虽然它 mutate tracker），它不持有预算值、不读取全局状态、不知道 token 从哪来。真正将它嵌入 Agent Loop 的是 `query.ts` 中的胶水代码。完整协作跨越四个文件：
 
-定价阶梯以 `$X per Mtok` 为单位，覆盖 6 个 tier：
-
-```typescript
-// src/utils/modelCost.ts:36-87
-// Standard: $3 in / $15 out per Mtok（Sonnet 全系列）
-export const COST_TIER_3_15 = {
-  inputTokens: 3, outputTokens: 15, promptCacheWriteTokens: 3.75,
-  promptCacheReadTokens: 0.3, webSearchRequests: 0.01,
-} as const satisfies ModelCosts
-
-// Opus 4/4.1: $15 in / $75 out per Mtok
-export const COST_TIER_15_75 = { /* ... */ }
-
-// Opus 4.5: $5 in / $25 out per Mtok
-export const COST_TIER_5_25 = { /* ... */ }
-
-// Opus 4.6 fast mode: $30 in / $150 out per Mtok
-export const COST_TIER_30_150 = { /* ... */ }
-
-// Haiku 3.5 / 4.5 独立定价
-export const COST_HAIKU_35 = { inputTokens: 0.8, outputTokens: 4, /* ... */ }
-export const COST_HAIKU_45 = { inputTokens: 1, outputTokens: 5, /* ... */ }
+```mermaid
+flowchart TD
+    subgraph 输入解析
+        A["src/utils/tokenBudget.ts<br/>parseTokenBudget('+500k')"] --> B["解析结果: 500000"]
+    end
+    subgraph 全局状态
+        B --> C["src/bootstrap/state.ts<br/>snapshotOutputTokensForTurn(500000)"]
+        C --> D["outputTokensAtTurnStart = 当前累计<br/>currentTurnTokenBudget = 500000<br/>budgetContinuationCount = 0"]
+    end
+    subgraph queryLoop入口
+        D --> E["src/query.ts:280<br/>createBudgetTracker()"]
+        E --> F["tracker: { continuationCount:0, lastDeltaTokens:0,<br/>lastGlobalTurnTokens:0, startedAt: Date.now() }"]
+    end
+    subgraph 每轮判定
+        F --> G["query.ts:1309-1314<br/>checkTokenBudget(tracker, agentId, budget, turnTokens)"]
+        G --> H["src/query/tokenBudget.ts:45<br/>三条路径分流"]
+    end
+    subgraph 决策执行
+        H -->|"continue"| I["query.ts:1316-1341<br/>注入 nudge 消息 → continue"]
+        H -->|"stop+event"| J["query.ts:1343-1354<br/>打点遥测 → return completed"]
+        H -->|"stop silent"| K["query.ts:1357<br/>return completed"]
+    end
 ```
 
-`MODEL_COSTS` 映射使用 `ModelShortName` 作为 key，通过 `firstPartyNameToCanonical()` 将每个模型的内部名称转换后挂载。当模型不在映射表中时（例如第三方自定义模型、新增模型尚未更新配置），使用**两种兜底**：
+**初始化：两个时间点**
+
+时间点 ①——**queryLoop 之前**（由 REPL 层调用）：
 
 ```typescript
-// src/utils/modelCost.ts:144-163
-export function getModelCosts(model: string, usage: Usage): ModelCosts {
-  const shortName = getCanonicalName(model)
-  // Opus 4.6 动态判断 fast mode 决定定价
-  if (shortName === firstPartyNameToCanonical(CLAUDE_OPUS_4_6_CONFIG.firstParty)) {
-    const isFastMode = usage.speed === 'fast'
-    return getOpus46CostTier(isFastMode)
-  }
-  const costs = MODEL_COSTS[shortName]
-  if (!costs) {
-    trackUnknownModelCost(model, shortName)           // 打点遥测
-    return (
-      MODEL_COSTS[getCanonicalName(getDefaultMainLoopModelSetting())]  // 回到默认模型定价
-      ?? DEFAULT_UNKNOWN_MODEL_COST                                   // 最终兜底: 5_25
-    )
-  }
-  return costs
+// src/bootstrap/state.ts:733-737
+export function snapshotOutputTokensForTurn(budget: number | null): void {
+  outputTokensAtTurnStart = getTotalOutputTokens()  // 快照当前累计
+  currentTurnTokenBudget = budget                    // 存储预算值
+  budgetContinuationCount = 0                        // 重置连续计数
 }
+```
+
+这里的设计意图是：预算的"计量起点"是**当前已累计的输出 token**——此前的 token 不计入本回合预算。同时 `budgetContinuationCount` 归零，因为这是一个新的用户回合。
+
+时间点 ②——**queryLoop 入口**（query.ts 第 280 行）：
+
+```typescript
+// src/query.ts:280
+const budgetTracker = feature('TOKEN_BUDGET') ? createBudgetTracker() : null
+```
+
+`createBudgetTracker()` 的生命周期 = 一次 `query()` 调用。它与 `state.ts` 中的全局变量互不感知——前者是**本轮内的连续状态**，后者是**跨轮共享的计量基准**。
+
+**决策消费：三条路径在 query.ts 中的响应**
+
+```typescript
+// src/query.ts:1308-1357
+if (feature('TOKEN_BUDGET')) {
+  const decision = checkTokenBudget(
+    budgetTracker!,
+    toolUseContext.agentId,        // null = 主线程, string = 子智能体
+    getCurrentTurnTokenBudget(),   // 来自 state.ts 模块变量
+    getTurnOutputTokens(),         // totalOutputTokens - outputTokensAtTurnStart
+  )
+
+  // 路径 1: Continue → 注入 nudge，重新进入循环
+  if (decision.action === 'continue') {
+    incrementBudgetContinuationCount()   // 同步 state.ts 全局计数
+    state = {
+      messages: [
+        ...messagesForQuery,
+        ...assistantMessages,
+        createUserMessage({
+          content: decision.nudgeMessage, // "Stopped at 45%..."
+          isMeta: true,
+        }),
+      ],
+      // ...
+      transition: { reason: 'token_budget_continuation' },
+    }
+    continue  // ← 跳回 while(true) 顶部
+  }
+
+  // 路径 2: Stop with event → 打点，然后 fall through 到 return
+  if (decision.completionEvent) {
+    logEvent('tengu_token_budget_completed', {
+      ...decision.completionEvent,
+      queryChainId, queryDepth,
+    })
+  }
+  // 路径 3: Stop silent → 直接 fall through
+}
+return { reason: 'completed' }
+```
+
+三个输入参数各有来历：
+
+| 参数 | 来源 | 含义 | 性质 |
+|------|------|------|------|
+| `agentId` | toolUseContext | 子智能体检测 | 区分主线程/子智能体 |
+| `budget` | `getCurrentTurnTokenBudget()` | 用户设置的预算值 | 跨轮不变 |
+| `globalTurnTokens` | `getTurnOutputTokens()` | 从回合开始到现在的输出 token 总量 | 单调递增 |
+
+`getTurnOutputTokens()` 的关键性质是**单调递增**——`getTotalOutputTokens() - outputTokensAtTurnStart`。每一轮 API 调用追加 output token，所以这个值只增不减。BudgetTracker 用它减去上一轮的 `lastGlobalTurnTokens` 得到本轮增量。
+
+Continue 路径做了四件事：
+1. 同步 `state.ts` 的 `budgetContinuationCount`（供 status line 等 UI 组件读取）
+2. 将 nudge 消息以 `isMeta: true` 注入消息历史——meta 消息在序列化时被特殊处理，不消耗上下文窗口的"正式"容量
+3. 设置 `transition.reason = 'token_budget_continuation'`（让测试能断言恢复路径）
+4. `continue` 重新进入 while 循环，下一轮模型会基于 nudge 消息继续工作
+
+Stop 路径统一返回 `{ reason: 'completed' }`——对外部调用者而言，预算耗尽就是正常完成。注意这里返回的 reason 是 `'completed'` 而不是 `'token_budget_exhausted'`：调用方不需要区分"自然结束"和"预算终止"。
+
+#### 3.4.3 两个 continuationCount 的分工
+
+这是最容易混淆的设计点。系统中存在**两个** `continuationCount`，它们独立递增但数值相同：
+
+| 位置 | 变量 | 作用域 | 职责 | 递增时机 |
+|------|------|--------|------|---------|
+| `src/query/tokenBudget.ts` | `tracker.continuationCount` | 一次 `query()` 调用内 | 判定收益递减（需 ≥3） | `checkTokenBudget` continue 分支内 |
+| `src/bootstrap/state.ts` | `budgetContinuationCount`（模块级） | 跨 query 调用 | 供 status line 等 UI 组件读取 | `query.ts:1317` 的 `incrementBudgetContinuationCount()` |
+
+为什么需要两个？因为 `tracker` 是 queryLoop 的局部变量，外部 UI 组件无法访问。而 `state.ts` 的模块变量可以被任何地方读取——这是典型的"局部状态 + 全局投影"模式：
+
+```
+tracker.continuationCount        → 决策逻辑使用（封装在 queryLoop 内）
+budgetContinuationCount (state)  → UI 观测使用（暴露给外部）
+```
+
+`checkTokenBudget` 内部的递减判定只用 `tracker.continuationCount`（第 60 行），**不读取全局的那个**。两者通过 `query.ts` 中的 `incrementBudgetContinuationCount()` 保持同步。
+
+#### 3.4.4 收益递减检测的时序推演
+
+以 budget = 500k 为例，推演模型连续多轮在 `!needsFollowUp` 被拦截的递减检测过程：
+
+```
+轮 1: turnTokens=100k, delta=100k, lastDelta=0
+      pct=20% < 90%, 未递减 → Continue
+      tracker: { continuationCount:1, lastDeltaTokens:100000, lastGlobalTurnTokens:100000 }
+
+轮 2: turnTokens=200k, delta=100k, lastDelta=100000
+      pct=40% < 90%, 未递减 → Continue
+      tracker: { continuationCount:2, lastDeltaTokens:100000, lastGlobalTurnTokens:200000 }
+
+轮 3: turnTokens=283k, delta=3k, lastDelta=100000
+      pct=57% < 90%
+      continuationCount=3 >= 3 ✓
+      deltaSinceLastCheck=3000 < 500? NO → 未递减 → Continue  ← 单轮低产被容忍
+      tracker: { continuationCount:3, lastDeltaTokens:3000, lastGlobalTurnTokens:283000 }
+
+轮 4: turnTokens=283.3k, delta=300, lastDelta=3000
+      pct=57% < 90%
+      continuationCount=4 >= 3 ✓
+      deltaSinceLastCheck=300 < 500 ✓
+      lastDeltaTokens=3000 < 500? NO → 仍未递减 → Continue  ← 需要连续两轮
+      tracker: { continuationCount:4, lastDeltaTokens:300, lastGlobalTurnTokens:283300 }
+
+轮 5: turnTokens=283.5k, delta=200, lastDelta=300
+      pct=57% < 90%
+      continuationCount=5 >= 3 ✓
+      deltaSinceLastCheck=200 < 500 ✓
+      lastDeltaTokens=300 < 500 ✓ → ★ 递减确认 → Stop with event
 ```
 
 **设计要点：**
 
-- **`usage.speed === 'fast'` 动态定价**：Opus 4.6 的 fast mode 和标准模式是同一个 canonical name，但定价差 6 倍（$30/$150 vs $5/$25）——不能静态映射，只能看 API response 里的实际速度
-- **两级兜底**：`默认模型定价 → DEFAULT_UNKNOWN_MODEL_COST`——确保始终能算出一个近似值，同时打点 `tengu_unknown_model_cost` 让团队知道有未知模型
-- **`trackUnknownModelCost()` 的打点设计**：只打点一次（通过 `setHasUnknownModelCost()` 设置全局标记），避免每条消息都打一次——这是遥测成本控制的一个细节
-
-### 3.6 速率限制的"双通道"检测
-
-速率限制状态有两个检测通道，来源不同但写入同一个 `currentLimits` 全局状态：
-
-```typescript
-// src/services/claudeAiLimits.ts
-// 通道一：API 响应头（claude.ts 每次 API 调用后调用）
-//   extractQuotaStatusFromHeaders(headers)
-//     检查: unified-status → status (allowed/warning/rejected)
-//     检查: surpassed-threshold 头 → 提前预警
-//     检查: 时间-用量二维预警 → fallback 预警
-//     更新: rawUtilization（供 status line 脚本查询）
-
-// 通道二：API 错误响应
-//   extractQuotaStatusFromError(error)
-//     当 API 返回 429 时，从 error headers 中提取状态
-
-// 通道三（可选）：主动配额检查
-//   checkQuotaStatus()
-//     在交互会话中发送最小请求（1 token）探测配额状态
-//     非交互模式 (-p) 跳过：正式查询会在 claude.ts 中完成头解析
-```
-
-三层配额通过 `EARLY_WARNING_CONFIGS` 的优先级顺序检测：先检查服务端主动推送的 `surpassed-threshold` header，如果服务端未发送，再使用时间-用量二维计算作为 fallback。两种路径产出相同结构的 `ClaudeAILimits` 对象，通过 `emitStatusChange()` 统一通知所有 listener（包括 UI 组件和 status line 脚本）。
-
----
+- **`lastDeltaTokens` 充当"上一轮证据"**：`isDiminishing` 要求当前轮 AND 上一轮的 delta 都 < 500。这意味着从"正常产出"到"判定递减"需要至少 2 轮过渡——一轮把 lastDeltaTokens 压低，下一轮确认压低后的状态持续。
+- **轮 3 是关键的"宽容"轮**：delta=3000 > 500，虽然 continuationCount 已经 >= 3，但 `deltaSinceLastCheck` 不满足条件。这说明模型在轮 3 还在产出有意义的内容（可能是在写一个大文件的修改计划），系统没有误判。
+- **`< 500` 而非 `= 0`** 是务实选择——即使卡住的模型也在产生 token（重复试探、thinking block），真正的零产出几乎不存在。500 token 大约相当于生成一段中等长度的英文段落。
 
 ## 4. 总结
 
-1. **Token 管理是 Agent 系统的"经济学"**——不同于传统 API 的一次性计费，Agent Loop 的累积成本需要**事前估算 + 事中控制 + 事后统计**三层闭环，分别对应压缩决策、BudgetTracker 判定、成本显示三个场景
-2. **"精确 + 估算"双轨制度量的核心价值是决策一致性**：精确数据用于事后统计和成本显示（错误零容忍），估算数据用于事前决策（误差可容忍但必须统一算法），`tokenCountWithEstimation()` 作为唯一权威入口确保所有调用点用同一把尺子
+1. **Token 管理是 Agent 系统的"经济学"**——不同于传统 API 的一次性计费，Agent Loop 的累积成本需要**事前估算 + 事中控制 + 事后统计**三层闭环，分别对应压缩决策、BudgetTracker 判定、成本显示三个场景。全文围绕度量（事前/事后/成本）和控制（重试/预算）两个维度展开
+2. **"精确 + 估算"双轨制度量的核心价值是决策一致性**：精确数据用于事后统计和成本显示（错误零容忍），估算数据用于事前决策（误差可容忍但必须统一算法），`tokenCountWithEstimation()` 作为唯一权威入口确保所有调用点用同一把尺子。四层 fallback（Anthropic → Bedrock → Vertex → rough）和文件类型感知的 `bytesPerTokenForFileType` 在"粗略"中追求"够用"
 3. **BudgetTracker 的收益递减检测是"软着陆"机制**：不是一刀切停掉，而是通过 `continuationCount >= 3` + `lastDeltaTokens < 500` 的双条件检测"模型在空转"状态，0.9 的阈值留下安全余量让模型自然收尾
-4. **速率限制的三层结构**（5h / 7d / overage）对应不同时间尺度的保护策略，预警阈值引入时间-用量双维度判断——同样 50% 的用量，时间过了 60% 就预警，时间过了 80% 就不预警，这是对传统静态阈值的本质性升级
-5. **重试策略分层**是容量保护的"博弈论"：529 最多 3 次（防止 retry storm 加剧过载），非交互场景直接放弃（用户不等待、重试是纯浪费），fast mode 429 优先保 cache 而非立即降级
-6. **`message.id` 作为并行工具的分组键**是一个简洁且正确的设计——利用 API response 自身的唯一标识进行回溯去重，避免了引入新的分组数据结构的复杂性和错误可能性
-7. **定价兜底的两级 fallback**（默认模型 → `COST_TIER_5_25`）保证用户始终能看到一个近似成本，同时通过 `trackUnknownModelCost()` 打点让团队感知到配置缺失
+4. **重试策略分层**是容量保护的"博弈论"：529 最多 3 次（防止 retry storm 加剧过载），非交互场景直接放弃（用户不等待、重试是纯浪费），fast mode 429 优先保 cache 而非立即降级
+5. **`message.id` 作为并行工具的分组键**是一个简洁且正确的设计——利用 API response 自身的唯一标识进行回溯去重，避免了引入新的分组数据结构的复杂性和错误可能性
+6. **模型没有预算意识，BudgetTracker 通过 nudge 消息将预算进度注入模型下一轮输入**：`!needsFollowUp` 只表示模型本轮没有 tool_use，不等于"任务完成"。BudgetTracker 作为退出拦截器链的最后一环，在模型想停时检查预算进度——未耗尽则注入 `"Keep working — do not summarize"` 并 continue，实现"软着陆"式预算控制
 
-**覆盖边界：**
-- 本文聚焦 QueryEngine 循环内的 token 与成本管理机制
+****延伸阅读**：**
+- 本文聚焦 QueryEngine 循环内的 token 与成本管理机制（度量 + 控制）
+- 速率限制检测与通知机制（`claudeAiLimits.ts`、`rateLimitMessages.ts`、`usage.ts`）属于 API 基础设施的横切关注点，延后到 Part 8（权限与系统集成）
 - `promptCacheBreakDetection.ts`（727 行）——prompt cache 失效检测与调试，延后到 Part 6（上下文管理）
 - `policyLimits/index.ts`（663 行）——组织级策略限制的拉取与执行，延后到 Part 8（权限系统）
 - `mockRateLimits.ts`（882 行）——ANT-ONLY 测试基础设施，不纳入分析范围
@@ -571,13 +706,14 @@ export function getModelCosts(model: string, usage: Usage): ModelCosts {
 
 ## 5. 参考文献
 
-- [Anthropic API — Rate Limits](https://docs.anthropic.com/en/docs/build-with-claude/rate-limits)
 - [Anthropic API — Token Counting](https://docs.anthropic.com/en/docs/build-with-claude/token-counting)  
 - [Anthropic Platform — Pricing](https://platform.claude.com/docs/en/about-claude/pricing)
 - Claude Code 源码：
   - `src/utils/tokens.ts` — Usage 提取与上下文窗口计算
   - `src/services/tokenEstimation.ts` — 跨提供商 token 估算
   - `src/utils/modelCost.ts` — 模型定价与成本计算
+  - `src/cost-tracker.ts` — 成本汇聚中心
   - `src/query/tokenBudget.ts` — 预算跟踪状态机
+  - `src/bootstrap/state.ts` — 全局 Token 状态与回合快照
+  - `src/query.ts` — queryLoop 主循环，BudgetTracker 挂载与决策消费
   - `src/services/api/withRetry.ts` — 分层重试引擎
-  - `src/services/claudeAiLimits.ts` — 速率限制检测与预警
