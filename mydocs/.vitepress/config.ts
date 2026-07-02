@@ -134,6 +134,7 @@ export default withMermaid(
         collapsed: false,
         items: [
           { text: '附录1：系统级上下文组成', link: '/附录/附录1-系统级上下文组成' },
+          { text: '附录2：Anthropic 协议信息', link: '/附录/附录2-Anthropic协议信息' },
         ],
       },
     ],
