@@ -129,6 +129,13 @@ export default withMermaid(
           { text: '43. 设计原则回顾与通用化', link: '/part11/43-设计原则回顾与通用化' },
         ],
       },
+      {
+        text: '附录',
+        collapsed: false,
+        items: [
+          { text: '附录1：系统级上下文组成', link: '/附录/附录1-系统级上下文组成' },
+        ],
+      },
     ],
 
     socialLinks: [
