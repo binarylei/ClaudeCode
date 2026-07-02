@@ -8,7 +8,7 @@ hero:
   actions:
     - theme: brand
       text: 开始阅读
-      link: /guide/getting-started
+      link: /guide/00-目录与阅读指引
     - theme: alt
       text: 项目仓库
       link: https://github.com/binarylei/ClaudeCode
