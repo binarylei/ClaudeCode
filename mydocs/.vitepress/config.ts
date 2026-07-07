@@ -77,7 +77,7 @@ export default withMermaid(
           { text: '21. 上下文收集机制', link: '/part6/21-上下文收集机制' },
           { text: '22. 三层压缩策略（上）：Micro-Compact 与工具结果清理', link: '/part6/22-三层压缩策略-上-Micro-Compact与工具结果清理' },
           { text: '23. 三层压缩策略（下）：Compact 对话压缩与摘要', link: '/part6/23-三层压缩策略-下-Compact对话压缩与摘要' },
-          { text: '24. 记忆目录', link: '/part6/24-记忆目录' },
+          { text: '24. 记忆系统', link: '/part6/24-记忆系统' },
         ],
       },
       {
