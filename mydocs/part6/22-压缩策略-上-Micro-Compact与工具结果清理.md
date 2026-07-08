@@ -1,10 +1,10 @@
 ---
-title: "22. 三层压缩策略（上）：Micro-Compact 与工具结果清理"
+title: "22. 压缩策略（上）：Micro-Compact 与工具结果清理"
 description: "缓存热用 cache_edits、缓存冷用 content-clear、大结果持久化到磁盘——工具结果级压缩如何在零额外 API 调用的前提下维持上下文窗口健康"
 outline: [2, 3]
 ---
 
-# 22. 三层压缩策略（上）：Micro-Compact 与工具结果清理
+# 22. 压缩策略（上）：Micro-Compact 与工具结果清理
 
 在[第 21 章](../part6/21-上下文收集机制)中我们建立了上下文收集的完整管线——System Prompt 分层拼接、CLAUDE.md 注入、对话历史加载、动态附件收集，最终组装为一条完整的 LLM 输入。但有一个问题悬而未决：**上下文窗口是有限的，当消息不断堆积，窗口迟早会满。怎么办？**
 
@@ -471,7 +471,7 @@ if (toolsToDelete.length > 0) {
 - [Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents) — Anthropic 的 Agent 设计指南
 - 系列文章：
   - [第 21 章：上下文收集机制](../part6/21-上下文收集机制) — System Prompt 分层拼接到动态附件注入的完整管线
-  - 第 23 章：三层压缩策略（下）：Compact 对话压缩与摘要 — LLM 驱动的对话级摘要、Session Memory Compact、post-compact 恢复管线
+  - 第 23 章：压缩策略（下）：Compact 对话压缩与摘要 — LLM 驱动的对话级摘要、Session Memory Compact、post-compact 恢复管线
 - Claude Code 源码：
   - [`src/services/compact/microCompact.ts`](https://github.com/binarylei/claudecode/blob/main/src/services/compact/microCompact.ts) — Micro-Compact 主入口，两条路径分发
   - [`src/utils/toolResultStorage.ts`](https://github.com/binarylei/claudecode/blob/main/src/utils/toolResultStorage.ts) — 工具结果持久化与 Budget 控制
