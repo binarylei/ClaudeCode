@@ -44,6 +44,7 @@ export default withMermaid(
         text: 'Part 3：工具系统',
         collapsed: true,
         items: [
+          { text: '08. 工具注册与发现', link: '/part3/08-工具注册与发现' },
           { text: '09. 工具基类设计', link: '/part3/09-工具基类设计' },
           { text: '10. 工具注册与延迟发现', link: '/part3/10-工具注册与延迟发现' },
           { text: '11. 行动层工具', link: '/part3/11-行动层工具' },
