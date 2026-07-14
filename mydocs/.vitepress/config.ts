@@ -48,7 +48,7 @@ export default withMermaid(
           { text: '09. 工具执行', link: '/part3/09-工具执行' },
         ],
       },
-      {
+      /* {
         text: 'Part 4：命令系统',
         collapsed: true,
         items: [
@@ -56,14 +56,13 @@ export default withMermaid(
           { text: '16. 命令分类解析', link: '/part4/16-命令分类解析' },
           { text: '17. 特性门控命令', link: '/part4/17-特性门控命令' },
         ],
-      },
+      }, */
       {
         text: 'Part 5：知识系统',
         collapsed: true,
         items: [
-          { text: '18. 技能系统设计', link: '/part5/18-技能系统设计' },
-          { text: '19. 渐进式披露', link: '/part5/19-渐进式披露' },
-          { text: '20. 插件架构', link: '/part5/20-插件架构' },
+          { text: '18. SKILLS 渐进式披露', link: '/part5/18-SKILLS渐进式披露' },
+          { text: '19. 插件架构', link: '/part5/19-插件架构' },
         ],
       },
       {
