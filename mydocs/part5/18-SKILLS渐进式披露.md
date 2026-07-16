@@ -78,31 +78,26 @@ flowchart LR
 
 ### 2.1 整体架构概览
 
-Claude Code 的 SKILL 系统可以抽象为四条严格按顺序衔接的管线：**注册 → 展示 → 注入 → 执行**。
+Claude Code 的 SKILL 系统可以抽象为三条管线：**注册 → 注入 → 执行**。
 
 ```mermaid
 flowchart LR
     subgraph 注册
-        A["六个来源汇集<br/>Bundled/Disk/Plugin/..."]
-    end
-    subgraph 展示
-        B["按预算格式化<br/>formatCommandsWithinBudget"]
+        A["六个来源汇集<br/>Bundled<br/>Disk<br/>Plugin<br/>...<br/>"]
     end
     subgraph 注入
-        C["三层管线<br/>Prompt → 附件 → Delta"]
+        B["格式化<br/>Prompt<br/>附件<br/>Delta<br/><br/>"]
     end
     subgraph 执行
-        D["skill_tool 调度<br/>Inline 或 Fork"]
+        C["skill_tool 调度<br/>Inline<br/>Fork<br/><br/><br/>"]
     end
     
-    A --> B --> C --> D
+    A --> B --> C
 ```
 
 - **注册**：从六个来源（Bundled、Disk、Plugin、MCP、Dynamic、Conditional）汇集所有技能，解析元数据、去重合并，输出结构化的技能注册表。回答的是：*系统有哪些技能可用？*
 
-- **展示**：从注册表中读取数据，调用 `formatCommandsWithinBudget()` 按预算格式化——预算决定展示哪些技能、展示到什么详细度。回答的是：*给模型看哪些、看多少？*
-
-- **注入**：把格式化文本通过三层管线递送到模型上下文：System Prompt 分段承载稳定部分、附件通道承载变化部分、Delta 通道只发送差异部分。回答的是：*怎么送进去？*
+- **注入**：把格式化文本通过三层管线递送到模型上下文：System Prompt 分段承载稳定部分、附件通道承载变化部分、Delta 通道只发送差异部分。回答的是：*怎么注入上下文？*
 
 - **执行**：由 Skill Tool 统一调度——模型选中技能后，Skill Tool 先验证再决策（是否存在、权限是否满足），决定 inline 注入还是 fork 隔离。回答的是：*选中的技能怎么跑？*
 
@@ -156,7 +151,7 @@ System Prompt 静态+动态段
 
 主流方案中，一个技能被注册的同时也就进入了模型的可见范围，即"注册即披露"。Claude Code 将这两个阶段拆开：**注册是注册，披露是披露，两者之间隔着条件和时机。**
 
-**注册阶段——六个来源汇集。** 技能可以来自编译时内置（Bundled）、文件系统扫描（Disk）、插件分发（Plugin）、远程 MCP 服务器（MCP）、文件操作时的目录遍历（Dynamic）、以及声明了路径条件的条件技能（Conditional）。多源并行必然带来重复，去重基准是 `realpath` 解析后的真实路径——选择 realpath 而非 inode，是因为某些虚拟文件系统返回的 inode 为 0，而 realpath 在所有平台下行为一致。
+**注册阶段——六个来源汇集。** 技能可以来自编译时内置（Bundled）、文件系统扫描（Disk）、插件分发（Plugin）、远程 MCP 服务器（MCP）、文件操作时的目录遍历（Dynamic）、以及声明了路径条件的条件技能（Conditional）。多源并行必然带来重复，去重基准是 `realpath` 解析后的真实路径。
 
 **披露阶段——条件技能是最彻底的实践。** 条件技能注册了但不在激活状态，不占用注入管线的任何预算。用户 clone 了一个包含 Python 技能的项目，但直到他编辑第一个 `.py` 文件，系统才知道需要激活这个技能。在那之前，这个技能不存在于模型的视野中。
 
