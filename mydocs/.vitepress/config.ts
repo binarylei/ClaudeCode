@@ -46,6 +46,8 @@ export default withMermaid(
         items: [
           { text: '08. 工具注册与延迟发现', link: '/part3/08-工具注册与延迟发现' },
           { text: '09. 工具执行', link: '/part3/09-工具执行' },
+          { text: '18. 命令系统的统一框架', link: '/part4/15-命令系统的统一框架' },
+          { text: '18. SKILLS 渐进式披露', link: '/part5/18-SKILLS渐进式披露' },
         ],
       },
       /* {
@@ -61,7 +63,6 @@ export default withMermaid(
         text: 'Part 5：知识系统',
         collapsed: true,
         items: [
-          { text: '18. SKILLS 渐进式披露', link: '/part5/18-SKILLS渐进式披露' },
           { text: '19. 插件架构', link: '/part5/19-插件架构' },
         ],
       },
